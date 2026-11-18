@@ -1,0 +1,24 @@
+{
+  "batch": "demo-2026-11-18-r1",
+  "observations": [
+    {"source":"station-lab","station":"A","revision":"r1","x":0,"r_u":1,"r_v":0,"unit":"ug/m3"},
+    {"source":"station-lab","station":"B","revision":"r1","x":0,"r_u":-1,"r_v":0,"unit":"ug/m3"},
+    {"source":"station-lab","station":"C","revision":"r1","x":0,"r_u":0,"r_v":0,"unit":"ug/m3"}
+  ],
+  "cohort": [["station-lab","A","r1"],["station-lab","B","r1"],["station-lab","C","r1"]],
+  "calibration": {
+    "source": "calibration-lab",
+    "revision": "c1",
+    "variables": ["U", "V"],
+    "scenarios": [
+      {"kind":"rectangle","weight":"1/2","u_lo":-1,"u_hi":1,"v_lo":-1,"v_hi":1},
+      {"kind":"point","weight":"1/2","u":0,"v":0}
+    ],
+    "rule": {"delta":0,"alpha":1,"beta":1,"gamma":1,"version":"affine-v1","input_unit":"ug/m3","output_unit":"score"}
+  },
+  "score_request": "demo-score-r1",
+  "analysis_request": "demo-analysis-r1",
+  "k": 1,
+  "targets": ["A", "B"],
+  "expected": {"marginals":["3/4","3/4"],"joint":"1/2","union":1}
+}
