@@ -39,16 +39,35 @@ def _comparison_planes(frame):
             yield HalfPlane(*canonical)
 
 
+def _signs(polygon, plane):
+    """Classify a convex cell against a plane: 'pos', 'neg' or 'split'."""
+    values = [plane.evaluate(point) for point in polygon]
+    if all(value >= 0 for value in values):
+        return "pos"
+    if all(value <= 0 for value in values):
+        return "neg"
+    return "split"
+
+
 def iter_event_regions(event, support):
     cells = [list(support)]
     for plane in _comparison_planes(event.frame):
         opposite = HalfPlane(-plane.a, -plane.b, -plane.c)
         split = []
         for cell in cells:
-            for side in (plane, opposite):
-                piece = clip_halfplane(cell, side)
-                if polygon_area(piece) > 0:
-                    split.append(piece)
+            side = _signs(cell, plane)
+            if side == "pos":
+                split.append(cell)
+            elif side == "neg":
+                for other in (opposite,):
+                    piece = clip_halfplane(cell, other)
+                    if polygon_area(piece) > 0:
+                        split.append(piece)
+            else:
+                for other in (plane, opposite):
+                    piece = clip_halfplane(cell, other)
+                    if polygon_area(piece) > 0:
+                        split.append(piece)
         cells = split
     for cell in cells:
         count = len(cell)

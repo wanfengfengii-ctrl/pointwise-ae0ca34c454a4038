@@ -12,6 +12,8 @@ from monitor.scoring.results import load_score_result
 from monitor.analysis.results import parse_analysis_request, AnalysisError
 from monitor.analysis.events import build_ranking_event
 from monitor.analysis.measure import integrate_ranking_event
+from monitor.analysis.curves import curve_for_path
+from monitor.scoring.paths import load_path_result
 from monitor.archive.catalog import lookup_request, publish_artifact
 from monitor.archive.database import ArchiveDatabase
 from monitor.archive.reading import read_result, ReadError
@@ -34,6 +36,26 @@ def analyze(db, request_id, score_id, k, targets):
         result = integrate_ranking_event(event, model)
         return publish_artifact(db, "report", result.to_payload(), {"score": score_id},
                                 ("analyze", request_id, request.to_payload()))
+
+
+def analyze_path(db, request_id, path_id, k, targets):
+    identifier(request_id)
+    with db.transaction():
+        try:
+            path = load_path_result(db, identifier(path_id))
+            model = load_calibration_model(db, path.frame.model_id)
+            request = parse_analysis_request(path.frame, path.score_id, k, targets)
+        except (ReadError, ObservationError) as exc:
+            if isinstance(exc, AnalysisError):
+                raise
+            raise AnalysisError("unknown or corrupt path input") from exc
+        inputs = dict(path_id=path.id, k=request.k, targets=list(request.targets))
+        previous = lookup_request(db, "analyze_path", request_id, inputs)
+        if previous is not None:
+            return previous
+        result = curve_for_path(path, model, request.k, request.targets)
+        return publish_artifact(db, "path_report", result, {"path": path.id},
+                                ("analyze_path", request_id, inputs))
 
 
 def run_daily_manifest(db, manifest):

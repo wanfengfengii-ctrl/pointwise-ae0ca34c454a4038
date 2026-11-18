@@ -201,6 +201,7 @@ def assert_rollback(db, operation):
 def run_paths(verbose=False):
     from monitor.scoring.jobs import score_path
     from monitor.analysis.jobs import analyze_path
+    evidence = []
     for name, case in CASES.items():
         with TemporaryDirectory(prefix="path-example-") as folder:
             db_path = Path(folder) / "archive.sqlite"
@@ -276,15 +277,104 @@ def run_paths(verbose=False):
             db_path.unlink()
             recomputed = verify_bundle(text)
             assert recomputed == {k: v for k, v in saved["payload"].items() if k != "parents"}
+            facts = dict(case=name, breakpoints=[str(v) for v in saved["payload"]["breakpoints"]],
+                         pieces=len(saved["payload"]["pieces"]),
+                         offline_matches=True)
+            knots = saved["payload"]["breakpoints"]
+            pieces = saved["payload"]["pieces"]
+            isolated = []
+            for index in range(1, len(knots) - 1):
+                actual = saved["payload"]["values"][index]
+                left = evaluate({"breakpoints": knots[index-1:index+1],
+                                 "values": [actual, actual],
+                                 "pieces": [pieces[index-1]]},
+                                (knots[index-1] + knots[index]) / 2)
+                left_at_knot = dict(
+                    marginals=[sum((c * knots[index] ** i for i, c in enumerate(p)), F(0))
+                               for p in pieces[index-1]["marginals"]],
+                    joint=sum((c * knots[index] ** i for i, c in enumerate(pieces[index-1]["joint"])), F(0)),
+                    union=sum((c * knots[index] ** i for i, c in enumerate(pieces[index-1]["union"])), F(0)))
+                if left_at_knot != actual:
+                    isolated.append(str(knots[index]))
+            facts["isolated_knots"] = isolated
             if verbose:
                 print(canonical_json(dict(case=name, curve=saved["payload"], offline=recomputed)))
+            evidence.append(facts)
         with ArchiveDatabase() as db:
             parent = seed(db, case, reverse=True)
             path = score_path(db, "path", parent, case["directions"], case["lo"], case["hi"])
             check_path_payload(db, path, parent, case)
             identity = analyze_path(db, "curve", path, case["k"], case["targets"])
             assert curve_fields(read_result(db, identity)["payload"]) == expected_curve(case)
-    print(canonical_json(dict(mode="paths", cases=list(CASES))))
+    print(canonical_json(dict(mode="paths", cases=list(CASES), evidence=evidence)))
+
+
+def run_v1_demo():
+    """The original daily manifest demo: real V1 report plus offline verify."""
+    import json
+    from monitor.analysis.jobs import _run
+    manifest = json.loads(Path("run_manifest.json").read_text(encoding="utf-8"))
+    with TemporaryDirectory(prefix="manifest-demo-") as folder:
+        _run(manifest, Path(folder) / "manifest.sqlite",
+             Path(folder) / "manifest-report.json")
+
+
+def demo_correction_reopen():
+    """Real curve, then a correction and reopen, then explicit offline
+    recomputation of both the frozen old curve and a newly built correction
+    curve."""
+    from monitor.scoring.jobs import score_path
+    from monitor.analysis.jobs import analyze_path
+    case = CASES["mixed"]
+    with TemporaryDirectory(prefix="path-correction-") as folder:
+        db_path = Path(folder) / "archive.sqlite"
+        target = Path(folder) / "frozen-curve.json"
+        with ArchiveDatabase(db_path) as db:
+            parent = seed(db, case)
+            path = score_path(db, "path", parent, case["directions"], case["lo"], case["hi"])
+            old = analyze_path(db, "curve", path, case["k"], case["targets"])
+            old_saved = read_result(db, old)["payload"]
+            old_path = read_result(db, path)["payload"]
+            corrected = dict(source="path-lab", station="A", revision="r2",
+                             x=3, r_u=0, r_v=0, unit="ug/m3")
+            ingest(db, "correction", [corrected])
+            cohort = freeze_cohort(db, [("path-lab", "A", "r2"),
+                                        ("path-lab", "B", "r1"),
+                                        ("path-lab", "C", "r1")])
+            model = save_calibration(db, dict(
+                source="path-calibration", revision="c1", variables=["U", "V"],
+                scenarios=deepcopy(case["scenarios"]),
+                rule=dict(delta=0, alpha=case["alpha"], beta=1, gamma=1,
+                          version="affine-v1", input_unit="ug/m3", output_unit="score")))
+            new_parent = score(db, "corrected-parent", cohort, model)
+            new_path = score_path(db, "corrected-path", new_parent,
+                                  case["directions"], case["lo"], case["hi"])
+            new_curve = analyze_path(db, "corrected-curve", new_path, case["k"],
+                                     case["targets"])
+            new_saved = read_result(db, new_curve)["payload"]
+            assert read_result(db, old) == dict(
+                id=old, kind="path_report", payload=old_saved,
+                lineage=read_result(db, old)["lineage"])
+            assert read_result(db, path)["payload"] == old_path
+            export_result(db, old, target)
+            frozen_text = target.read_text(encoding="utf-8")
+            export_result(db, new_curve, Path(folder) / "corrected-curve.json")
+            corrected_text = (Path(folder) / "corrected-curve.json").read_text(encoding="utf-8")
+        db_path.unlink()
+        frozen_offline = verify_bundle(frozen_text)
+        corrected_offline = verify_bundle(corrected_text)
+        assert frozen_offline == {k: v for k, v in old_saved.items() if k != "parents"}
+        assert corrected_offline == {k: v for k, v in new_saved.items() if k != "parents"}
+        assert frozen_offline["values"] == old_saved["values"]
+        assert corrected_offline["values"] != frozen_offline["values"]
+        print(canonical_json(dict(
+            case="mixed-correction",
+            frozen_curve=old_saved,
+            corrected_curve=new_saved,
+            frozen_offline_matches=True,
+            corrected_offline_matches=True,
+            old_parent_unchanged=True,
+            oracle="correction r2 (x=3 at A) changes only the corrected path")))
 
 
 def main():
@@ -298,7 +388,11 @@ def main():
             suite = unittest.defaultTestLoader.discover("tests")
             if not unittest.TextTestRunner(verbosity=1).run(suite).wasSuccessful():
                 return 1
+        else:
+            run_v1_demo()
         run_paths(verbose=mode == "demo")
+        if mode == "demo":
+            demo_correction_reopen()
     return 0
 
 

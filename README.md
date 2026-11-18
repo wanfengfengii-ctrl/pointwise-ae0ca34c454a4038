@@ -12,6 +12,7 @@ Python 3.11标准库离线工具。站点实验室提交检测与更正修订，
 6. 积分同一个排名事件，得到边缘、共同及至少一个入选概率。
 7. 原子发布报告，协调员按ID读取结果和完整来源。
 8. 导出自足包，在没有原数据库时显式复算；更正生成新修订和新成果。
+9. 对固定评分提交各站浓度方向与有限参数区间，得到完整复测概率曲线。
 
 ## 运行
 
@@ -19,6 +20,8 @@ Python 3.11标准库离线工具。站点实验室提交检测与更正修订，
 
     python3 -B -m unittest discover -s tests
     python3 -B -m monitor.analysis.jobs demo --manifest run_manifest.json
+    python3 -B path_examples.py verify
+    python3 -B path_examples.py demo
 
 demo在系统临时目录创建数据库和交付包，实际执行接纳、固定、评分、分析、读取、导出和离线复算，核对手算结果后清理。输出实际报告和POINTWISE_SCENARIO JSON。
 
@@ -39,8 +42,8 @@ CLI业务错误输出error JSON到stderr并退出2；unittest保留正常失败�
     from monitor.observations.revisions import ingest
     from monitor.observations.cohorts import freeze_cohort
     from monitor.calibration.models import save_calibration
-    from monitor.scoring.jobs import score
-    from monitor.analysis.jobs import analyze
+    from monitor.scoring.jobs import score, score_path
+    from monitor.analysis.jobs import analyze, analyze_path
     from monitor.archive.reading import read_result
     from monitor.archive.delivery import export_result, verify_bundle
 
@@ -50,10 +53,14 @@ ArchiveDatabase(path)支持上下文管理；省略path使用内存库。
 - freeze_cohort(db, references)返回队列ID，引用为(source, station, revision)。
 - save_calibration(db, raw)返回模型ID。
 - score(db, request_id, cohort_id, model_id)返回评分ID。
+- score_path(db, request_id, score_id, directions, lo, hi)返回固定路径ID；directions键恰为父评分全部站点。
 - analyze(db, request_id, score_id, k, targets)返回报告ID。
+- analyze_path(db, request_id, path_id, k, targets)返回曲线报告ID。
 - read_result(db, id)返回独立字典，含id、kind、payload及以ID索引的lineage；报告payload含request、marginals、joint、union和parents，概率为Fraction。
-- export_result(db, report_id, path)原子替换交付目标。
-- verify_bundle(text_or_decoded_bundle)显式复算，返回含Fraction的报告值，不访问原数据库。
+- score_path的payload含score_id、stations、directions、coefficients、lo、hi和parents。
+- analyze_path的payload含request、breakpoints、pieces、values和parents；pieces为开段二次系数，values为分界处实际概率。
+- export_result(db, report_id, path)原子替换交付目标；支持report与path_report根。
+- verify_bundle(text_or_decoded_bundle)显式复算，返回含Fraction的报告值，不访问原数据库；曲线包返回request、breakpoints、pieces、values。
 
 run_manifest.json提供完整有限样例。领域值对象、纯计算函数和装载函数供同一流程复用。低层publish_artifact、修订登记及回执写入须由上层事务调用，不独立提前提交。
 
@@ -71,7 +78,7 @@ k为1至站点数的整数。严格高于某站的站点数少于k即入选，�
 
 ## 固定、错误及交付
 
-observations负责明确修订和有序队列；calibration负责不可变模型；scoring负责共享评分交接；analysis负责严格排名和混合测度；archive负责目录、事务、读取和交付。24个生产模块均接入业务流程。
+observations负责明确修订和有序队列；calibration负责不可变模型；scoring负责共享评分交接及固定浓度修正路径；analysis负责严格排名、混合测度与完整概率曲线；archive负责目录、事务、读取和交付。26个生产模块均接入业务流程。
 
 队列保存明确修订及来源快照，评分固定队列和模型，报告固定评分、名额和有序目标。更正、返回对象修改及数据库重开不改旧成果。读取与导出只检查固定数据及来源，不评分或积分；未知、未提交及损坏来源明确报错。摘要用于完整性核对，不是身份认证。
 
@@ -79,10 +86,12 @@ score和analyze请求命名空间独立。同身份同规范化输入复用，�
 
 观测、队列、校准、评分、分析错误分别为ObservationError、CohortError、CalibrationError、ScoringError、AnalysisError，继承ValueError。存储错误为StorageError及PublicationError/RequestConflictError子类，读取错误为ReadError，交付错误为DeliveryError，均继承RuntimeError。数据库事务原样传播注入的非SQLite异常；交付写出异常包装为DeliveryError。非法输入不发布成果。
 
-交付包版本1包含root、全部有类型父成果、精确载荷及source_digest，不依赖原机器路径。有理值编码为{"$fraction":[分子,正分母]}，顺序保留。verify_bundle核对闭包、类型、摘要和来源，再由原观测、规则及情景复算评分和报告。导出在目标同目录写临时文件，完成关闭后原子替换；替换前失败保留旧文件并清理临时内容。
+交付包版本1包含root、全部有类型父成果、精确载荷及source_digest，不依赖原机器路径。有理值编码为{"$fraction":[分子,正分母]}，顺序保留。verify_bundle核对闭包、类型、摘要和来源，再由原观测、规则及情景复算评分和报告；path_report根另按固定父链、方向与区间独立重算完整曲线并逐项比对。导出在目标同目录写临时文件，完成关闭后原子替换；替换前失败保留旧文件并清理临时内容。
+
+score_path固定父评分、逐站有理方向和有限闭区间，载荷含[ a,b,c,e ]行；analyze_path只消费该路径与来源模型，返回严格递增分界、每个开段的二次以内系数及分界处实际概率。分界覆盖比较线过矩形顶点、两线在边上相交、平行线重合、三线共点、空间恒等比较变号及点情景并列，开段值用精确三点插值并以单点积分复核；相同相邻式仅在分界实际值吻合时合并，孤立跳变与孤立并列保留。详见HANDOFF.md。
 
 ## 确定性回归
 
-8个测试文件覆盖：对向评分边缘各1/2、共同0、并集1；矩形和零点各半得到3/4、3/4、1/2、1；情景拆分；完整并列；非对称身份运输；非单位矩形和二维独立面积核账；请求与规则边界；批次冲突和精确重放；观测及校准更正；独立值副本、初始化保全和重开禁止重算；发布回滚、请求冲突和损坏读取；交付故障保全、脱离原库复算、伪造结果拒绝和示例重复执行。
+9个测试文件覆盖：对向评分边缘各1/2、共同0、并集1；矩形和零点各半得到3/4、3/4、1/2、1；情景拆分；完整并列；非对称身份运输；非单位矩形和二维独立面积核账；请求与规则边界；批次冲突和精确重放；观测及校准更正；独立值副本、初始化保全和重开禁止重算；发布回滚、请求冲突和损坏读取；交付故障保全、脱离原库复算、伪造结果拒绝和示例重复执行。新增测试另覆盖手算曲线、共点/平行/恒等比较面、零方向、空目标、单点区间、换序运输、故障回滚、更正重开及篡改拒绝。
 
 相同规范化输入、修订、队列顺序、模型、k和目标顺序产生相同内容ID与精确结果，不使用随机数或时间戳参与领域身份。

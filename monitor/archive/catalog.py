@@ -18,7 +18,9 @@ def _parent_types(kind, parents):
         return {}
     fixed = {"model": {"revision": "calibration_revision"},
              "score": {"cohort": "cohort", "model": "model"},
-             "report": {"score": "score"}}
+             "report": {"score": "score"},
+             "score_path": {"score": "score"},
+             "path_report": {"path": "score_path"}}
     if kind == "cohort" or kind == "receipt":
         if not parents or set(parents) != {"member:" + str(i) for i in range(len(parents))}:
             raise PublicationError("invalid member parent sequence")

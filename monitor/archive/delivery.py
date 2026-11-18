@@ -15,6 +15,8 @@ from monitor.scoring.representation import ScoreFrame
 from monitor.analysis.results import parse_analysis_request
 from monitor.analysis.events import build_ranking_event
 from monitor.analysis.measure import integrate_ranking_event
+from monitor.analysis.curves import curve_for_path
+from monitor.scoring.paths import path_from_payload
 
 
 class DeliveryError(RuntimeError):
@@ -23,7 +25,7 @@ class DeliveryError(RuntimeError):
 
 def build_bundle(db, report_id):
     root = read_result(db, report_id)
-    if root["kind"] != "report":
+    if root["kind"] not in ("report", "path_report"):
         raise DeliveryError("delivery requires a probability report")
     artifacts = [root["lineage"][key] for key in sorted(root["lineage"])]
     content = dict(root=report_id, artifacts=artifacts)
@@ -58,6 +60,73 @@ def export_result(db, report_id, target, fault=None):
                 os.unlink(temporary)
             except FileNotFoundError:
                 pass
+
+
+def _fixed_score(records, score_id):
+    scoring = records[score_id]["payload"]
+    frame = ScoreFrame.from_payload(scoring["frame"])
+    if scoring["parents"] != {"cohort": frame.cohort_id, "model": frame.model_id}:
+        raise DeliveryError("score parents differ")
+    cohort_payload = records[frame.cohort_id]["payload"]
+    members = tuple(parse_observation(v) for v in cohort_payload["members"])
+    validate_cohort_members(members)
+    revision_ids = tuple(cohort_payload["parents"]["member:" + str(i)] for i in range(len(members)))
+    if len(revision_ids) != len(cohort_payload["parents"]):
+        raise DeliveryError("cohort parent count differs")
+    for member, identity in zip(members, revision_ids):
+        if parse_observation(records[identity]["payload"]["observation"]) != member:
+            raise DeliveryError("cohort source snapshot differs")
+    cohort = Cohort(frame.cohort_id, members, revision_ids)
+    model_payload = records[frame.model_id]["payload"]
+    revision_id = model_payload["parents"]["revision"]
+    calibration = parse_calibration(model_payload["calibration"])
+    if calibration != parse_calibration(records[revision_id]["payload"]["calibration"]):
+        raise DeliveryError("calibration source snapshot differs")
+    axes = [revision_id + ":U", revision_id + ":V"]
+    if model_payload["axes"] != axes:
+        raise DeliveryError("model shared axes differ")
+    model = FrozenCalibrationModel(frame.model_id, revision_id, SharedAxes(*axes), calibration)
+    recomputed_frame = compile_scores(cohort, model)
+    if frame != recomputed_frame:
+        raise DeliveryError("stored affine scores do not match fixed inputs")
+    return frame, model
+
+
+def _verify_report(records, report_id):
+    report = records[report_id]
+    saved = report["payload"]
+    score_id = saved["parents"]["score"]
+    frame, model = _fixed_score(records, score_id)
+    request = saved["request"]
+    if set(request) != {"score_id", "k", "targets"} or request["score_id"] != score_id:
+        raise DeliveryError("report request differs from score parent")
+    request = parse_analysis_request(frame, score_id, request["k"], request["targets"])
+    result = integrate_ranking_event(build_ranking_event(frame, request), model).to_payload()
+    expected_saved = dict(result, parents={"score": score_id})
+    if saved != expected_saved:
+        raise DeliveryError("offline probability recomputation differs")
+    return result
+
+
+def _verify_path_report(records, report_id):
+    report = records[report_id]
+    saved = report["payload"]
+    path_id = saved["parents"]["path"]
+    path_payload = records[path_id]["payload"]
+    if path_payload.get("parents") != {"score": path_payload.get("score_id")}:
+        raise DeliveryError("path parent differs from stored score")
+    frame, model = _fixed_score(records, path_payload["score_id"])
+    path = path_from_payload(path_id, path_payload, frame, model)
+    request = saved["request"]
+    if (not isinstance(request, dict)
+            or set(request) != {"path_id", "k", "targets"}
+            or request["path_id"] != path_id):
+        raise DeliveryError("curve request differs from path parent")
+    result = curve_for_path(path, model, request["k"], request["targets"])
+    expected_saved = dict(result, parents={"path": path_id})
+    if saved != expected_saved:
+        raise DeliveryError("offline curve recomputation differs")
+    return result
 
 
 def _verify(bundle):
@@ -95,46 +164,12 @@ def _verify(bundle):
     visit(bundle["root"])
     if visited != set(records):
         raise DeliveryError("bundle must contain exactly the root closure")
-    report = records[bundle["root"]]
-    if report["kind"] != "report":
-        raise DeliveryError("bundle root is not a report")
-    saved = report["payload"]
-    score_id = saved["parents"]["score"]
-    scoring = records[score_id]["payload"]
-    frame = ScoreFrame.from_payload(scoring["frame"])
-    if scoring["parents"] != {"cohort": frame.cohort_id, "model": frame.model_id}:
-        raise DeliveryError("score parents differ")
-    cohort_payload = records[frame.cohort_id]["payload"]
-    members = tuple(parse_observation(v) for v in cohort_payload["members"])
-    validate_cohort_members(members)
-    revision_ids = tuple(cohort_payload["parents"]["member:" + str(i)] for i in range(len(members)))
-    if len(revision_ids) != len(cohort_payload["parents"]):
-        raise DeliveryError("cohort parent count differs")
-    for member, identity in zip(members, revision_ids):
-        if parse_observation(records[identity]["payload"]["observation"]) != member:
-            raise DeliveryError("cohort source snapshot differs")
-    cohort = Cohort(frame.cohort_id, members, revision_ids)
-    model_payload = records[frame.model_id]["payload"]
-    revision_id = model_payload["parents"]["revision"]
-    calibration = parse_calibration(model_payload["calibration"])
-    if calibration != parse_calibration(records[revision_id]["payload"]["calibration"]):
-        raise DeliveryError("calibration source snapshot differs")
-    axes = [revision_id + ":U", revision_id + ":V"]
-    if model_payload["axes"] != axes:
-        raise DeliveryError("model shared axes differ")
-    model = FrozenCalibrationModel(frame.model_id, revision_id, SharedAxes(*axes), calibration)
-    recomputed_frame = compile_scores(cohort, model)
-    if frame != recomputed_frame:
-        raise DeliveryError("stored affine scores do not match fixed inputs")
-    request = saved["request"]
-    if set(request) != {"score_id", "k", "targets"} or request["score_id"] != score_id:
-        raise DeliveryError("report request differs from score parent")
-    request = parse_analysis_request(frame, score_id, request["k"], request["targets"])
-    result = integrate_ranking_event(build_ranking_event(frame, request), model).to_payload()
-    expected_saved = dict(result, parents={"score": score_id})
-    if saved != expected_saved:
-        raise DeliveryError("offline probability recomputation differs")
-    return result
+    kind = records[bundle["root"]]["kind"]
+    if kind == "report":
+        return _verify_report(records, bundle["root"])
+    if kind == "path_report":
+        return _verify_path_report(records, bundle["root"])
+    raise DeliveryError("bundle root is not a probability report")
 
 
 def verify_bundle(bundle):
